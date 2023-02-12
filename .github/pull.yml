@@ -1,0 +1,16 @@
+version: "1"
+rules:
+  # Keep the main branch always up to date
+  - base: main
+    upstream: docker:main
+    mergeMethod: hardreset
+  # The staging branch contain our changes so we need to rebase.
+  - base: staging
+    mergeMethod: rebase
+    upstream: main # We rebase from main in the local forked repo.
+    assignees:
+      - tromai
+    reviewers:
+      - tromai
+    conflictReviewers:
+      - tromai
