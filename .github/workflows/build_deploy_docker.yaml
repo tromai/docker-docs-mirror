@@ -1,0 +1,39 @@
+name: Build and deploy Docker image 
+
+on:
+  push:
+    branches:
+      - 'staging'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Check out repository
+        uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # v3.1.0
+        with:
+          fetch-depth: 0
+      - 
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8c0edbc76e98fa90f69d9a2c020dcb50019dc325   # v2.2.1
+      - 
+        name: Login to GitHub Container Registry
+        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a   # v2.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      -
+        name: Build and push
+        uses: docker/build-push-action@c56af957549030174b10d6867f20e78cfd7debc5 
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/tromai/docker-docs:latest
+          cache-from: type=registry,ref=ghcr.io/tromai/docker-docs:buildcache
+          cache-to: type=registry,ref=ghcr.io/tromai/docker-docs:buildcache,mode=max
