@@ -1,5 +1,9 @@
 name: deploy
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   workflow_dispatch:
   push:
@@ -8,6 +12,11 @@ on:
       - main
       - published
 
+env:
+  # Use edge release of buildx (latest RC, fallback to latest stable)
+  SETUP_BUILDX_VERSION: edge
+  SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
+
 # these permissions are needed to interact with GitHub's OIDC Token endpoint.
 permissions:
   id-token: write
@@ -15,15 +24,16 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     if: github.repository_owner == 'docker'
     steps:
       -
         name: Prepare
         run: |
-          JEKYLL_ENV=development
+          HUGO_ENV=development
           DOCS_AWS_REGION=us-east-1
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            HUGO_ENV=staging
             DOCS_URL="https://docs-stage.docker.com"
             DOCS_AWS_IAM_ROLE="arn:aws:iam::710015040892:role/stage-docs-docs.docker.com-20220818202135984800000001"
             DOCS_S3_BUCKET="stage-docs-docs.docker.com"
@@ -32,7 +42,7 @@ jobs:
             DOCS_LAMBDA_FUNCTION_REDIRECTS="DockerDocsRedirectFunction-stage"
             DOCS_SLACK_MSG="Successfully deployed docs-stage from main branch. $DOCS_URL"
           elif [ "${{ github.ref }}" = "refs/heads/published" ]; then
-            JEKYLL_ENV=production
+            HUGO_ENV=production
             DOCS_URL="https://docs.docker.com"
             DOCS_AWS_IAM_ROLE="arn:aws:iam::710015040892:role/prod-docs-docs.docker.com-20220818202218674300000001"
             DOCS_S3_BUCKET="prod-docs-docs.docker.com"
@@ -41,6 +51,7 @@ jobs:
             DOCS_LAMBDA_FUNCTION_REDIRECTS="DockerDocsRedirectFunction-prod"
             DOCS_SLACK_MSG="Successfully deployed docs from published branch. $DOCS_URL"
           elif [ "${{ github.ref }}" = "refs/heads/lab" ]; then
+            HUGO_ENV=lab
             DOCS_URL="https://docs-labs.docker.com"
             DOCS_AWS_IAM_ROLE="arn:aws:iam::710015040892:role/labs-docs-docs.docker.com-20220818202218402500000001"
             DOCS_S3_BUCKET="labs-docs-docs.docker.com"
@@ -56,7 +67,7 @@ jobs:
             SEND_SLACK_MSG="false"
           fi
           echo "BRANCH_NAME=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
-          echo "JEKYLL_ENV=$JEKYLL_ENV" >> $GITHUB_ENV
+          echo "HUGO_ENV=$HUGO_ENV" >> $GITHUB_ENV
           echo "DOCS_URL=$DOCS_URL" >> $GITHUB_ENV
           echo "DOCS_AWS_REGION=$DOCS_AWS_REGION" >> $GITHUB_ENV
           echo "DOCS_AWS_IAM_ROLE=$DOCS_AWS_IAM_ROLE" >> $GITHUB_ENV
@@ -68,24 +79,31 @@ jobs:
           echo "SEND_SLACK_MSG=$SEND_SLACK_MSG" >> $GITHUB_ENV
       -
         name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       -
         name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
       -
         name: Build website
-        uses: docker/bake-action@v2
+        uses: docker/bake-action@v6
         with:
+          source: .
+          files: |
+            docker-bake.hcl
           targets: release
           set: |
             *.cache-from=type=gha,scope=deploy-${{ env.BRANCH_NAME }}
             *.cache-to=type=gha,scope=deploy-${{ env.BRANCH_NAME }},mode=max
+          provenance: false
       -
         name: Configure AWS Credentials
         if: ${{ env.DOCS_AWS_IAM_ROLE != '' }}
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.DOCS_AWS_IAM_ROLE }}
           aws-region: ${{ env.DOCS_AWS_REGION }}
@@ -93,12 +111,28 @@ jobs:
         name: Upload files to S3 bucket
         if: ${{ env.DOCS_S3_BUCKET != '' }}
         run: |
-          aws --region ${{ env.DOCS_AWS_REGION }} s3 sync --acl public-read _site s3://${{ env.DOCS_S3_BUCKET }}/ --delete
+          aws --region ${{ env.DOCS_AWS_REGION }} s3 sync \
+            --acl public-read \
+            --delete \
+            --exclude "*" \
+            --include "*.webp" \
+            --metadata-directive="REPLACE" \
+            --no-guess-mime-type \
+            --content-type="image/webp" \
+            public s3://${{ env.DOCS_S3_BUCKET }}/
+          aws --region ${{ env.DOCS_AWS_REGION }} s3 sync \
+            --acl public-read \
+            --delete \
+            --exclude "*.webp" \
+            public s3://${{ env.DOCS_S3_BUCKET }}/
       -
         name: Update S3 config
         if: ${{ env.DOCS_S3_BUCKET != '' && env.DOCS_S3_CONFIG != '' }}
-        uses: docker/bake-action@v2
+        uses: docker/bake-action@v6
         with:
+          source: .
+          files: |
+            docker-bake.hcl
           targets: aws-s3-update-config
           set: |
             *.cache-from=type=gha,scope=releaser
@@ -109,8 +143,11 @@ jobs:
       -
         name: Update Cloudfront config
         if: ${{ env.DOCS_CLOUDFRONT_ID != '' }}
-        uses: docker/bake-action@v2
+        uses: docker/bake-action@v6
         with:
+          source: .
+          files: |
+            docker-bake.hcl
           targets: aws-cloudfront-update
         env:
           AWS_REGION: us-east-1 # cloudfront and lambda edge functions are only available in us-east-1 region

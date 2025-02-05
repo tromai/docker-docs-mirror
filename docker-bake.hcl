@@ -1,112 +1,87 @@
-variable "JEKYLL_ENV" {
-  default = "development"
-}
-variable "DOCS_URL" {
-  default = "http://localhost:4000"
-}
-variable "DOCS_SITE_DIR" {
-  default = "_site"
-}
-variable "DOCS_ENFORCE_GIT_LOG_HISTORY" {
-  default = "0"
+variable "HUGO_ENV" {
+  default = null
 }
 
-target "_common" {
-  args = {
-    JEKYLL_ENV = JEKYLL_ENV
-    DOCS_URL = DOCS_URL
-    DOCS_ENFORCE_GIT_LOG_HISTORY = DOCS_ENFORCE_GIT_LOG_HISTORY
-  }
-  no-cache-filter = ["generate"]
+variable "DOCS_URL" {
+  default = null
+}
+
+variable "DOCS_SITE_DIR" {
+  default = "public"
+}
+
+variable "DRY_RUN" {
+  default = null
 }
 
 group "default" {
   targets = ["release"]
 }
 
-target "release" {
-  inherits = ["_common"]
-  target = "release"
-  output = [DOCS_SITE_DIR]
+target "index" {
+  # generate a new local search index
+  target = "index"
+  output = ["type=local,dest=static/pagefind"]
+  provenance = false
 }
 
-target "vendor" {
-  target = "vendor"
-  output = ["."]
+target "release" {
+  args = {
+    HUGO_ENV = HUGO_ENV
+    DOCS_URL = DOCS_URL
+  }
+  target = "release"
+  output = [DOCS_SITE_DIR]
+  provenance = false
 }
 
 group "validate" {
-  targets = ["htmlproofer", "mdl"]
+  targets = ["lint", "test", "unused-media", "test-go-redirects", "dockerfile-lint", "path-warnings"]
 }
 
-target "htmlproofer" {
-  inherits = ["_common"]
-  target = "htmlproofer"
+target "test" {
+  target = "test"
   output = ["type=cacheonly"]
+  provenance = false
 }
 
-target "htmlproofer-output" {
-  inherits = ["_common"]
-  target = "htmlproofer-output"
-  output = ["./lint"]
-}
-
-target "mdl" {
-  inherits = ["_common"]
-  target = "mdl"
+target "lint" {
+  target = "lint"
   output = ["type=cacheonly"]
+  provenance = false
 }
 
-target "mdl-output" {
-  inherits = ["_common"]
-  target = "mdl-output"
-  output = ["./lint"]
-  args = {
-    MDL_JSON = 1
-  }
+target "unused-media" {
+  target = "unused-media"
+  output = ["type=cacheonly"]
+  provenance = false
+}
+
+target "test-go-redirects" {
+  target = "test-go-redirects"
+  output = ["type=cacheonly"]
+  provenance = false
+}
+
+target "dockerfile-lint" {
+  call = "check"
+}
+
+target "path-warnings" {
+  target = "path-warnings"
+  output = ["type=cacheonly"]
 }
 
 #
-# releaser targets are defined in _releaser/Dockerfile
-# and are used for Netlify and AWS S3 deployment
+# releaser targets are defined in hack/releaser/Dockerfile
+# and are used for AWS S3 deployment
 #
 
 target "releaser-build" {
-  context = "_releaser"
+  context = "hack/releaser"
   target = "releaser"
   output = ["type=cacheonly"]
-}
-
-variable "NETLIFY_SITE_NAME" {
-  default = ""
-}
-
-target "_common-netlify" {
-  args = {
-    NETLIFY_SITE_NAME = NETLIFY_SITE_NAME
-  }
-  secret = [
-    "id=NETLIFY_AUTH_TOKEN,env=NETLIFY_AUTH_TOKEN"
-  ]
-}
-
-target "netlify-remove" {
-  inherits = ["_common-netlify"]
-  context = "_releaser"
-  target = "netlify-remove"
-  no-cache-filter = ["netlify-remove"]
-  output = ["type=cacheonly"]
-}
-
-target "netlify-deploy" {
-  inherits = ["_common-netlify"]
-  context = "_releaser"
-  target = "netlify-deploy"
-  contexts = {
-    sitedir = DOCS_SITE_DIR
-  }
-  no-cache-filter = ["netlify-deploy"]
-  output = ["type=cacheonly"]
+  provenance = false
 }
 
 variable "AWS_REGION" {
@@ -127,6 +102,7 @@ variable "AWS_LAMBDA_FUNCTION" {
 
 target "_common-aws" {
   args = {
+    DRY_RUN = DRY_RUN
     AWS_REGION = AWS_REGION
     AWS_S3_BUCKET = AWS_S3_BUCKET
     AWS_S3_CONFIG = AWS_S3_CONFIG
@@ -138,11 +114,12 @@ target "_common-aws" {
     "id=AWS_SECRET_ACCESS_KEY,env=AWS_SECRET_ACCESS_KEY",
     "id=AWS_SESSION_TOKEN,env=AWS_SESSION_TOKEN"
   ]
+  provenance = false
 }
 
 target "aws-s3-update-config" {
   inherits = ["_common-aws"]
-  context = "_releaser"
+  context = "hack/releaser"
   target = "aws-s3-update-config"
   no-cache-filter = ["aws-update-config"]
   output = ["type=cacheonly"]
@@ -150,7 +127,7 @@ target "aws-s3-update-config" {
 
 target "aws-lambda-invoke" {
   inherits = ["_common-aws"]
-  context = "_releaser"
+  context = "hack/releaser"
   target = "aws-lambda-invoke"
   no-cache-filter = ["aws-lambda-invoke"]
   output = ["type=cacheonly"]
@@ -158,11 +135,45 @@ target "aws-lambda-invoke" {
 
 target "aws-cloudfront-update" {
   inherits = ["_common-aws"]
-  context = "_releaser"
+  context = "hack/releaser"
   target = "aws-cloudfront-update"
   contexts = {
     sitedir = DOCS_SITE_DIR
   }
   no-cache-filter = ["aws-cloudfront-update"]
   output = ["type=cacheonly"]
+}
+
+variable "VENDOR_MODULE" {
+  default = null
+}
+
+target "vendor" {
+  target = "vendor"
+  args = {
+    MODULE = VENDOR_MODULE
+  }
+  output = ["."]
+  provenance = false
+}
+
+variable "UPSTREAM_MODULE_NAME" {
+  default = null
+}
+variable "UPSTREAM_REPO" {
+  default = null
+}
+variable "UPSTREAM_COMMIT" {
+  default = null
+}
+
+target "validate-upstream" {
+  args {
+    UPSTREAM_MODULE_NAME = UPSTREAM_MODULE_NAME
+    UPSTREAM_REPO = UPSTREAM_REPO
+    UPSTREAM_COMMIT = UPSTREAM_COMMIT
+  }
+  target = "validate-upstream"
+  output = ["type=cacheonly"]
+  provenance = false
 }

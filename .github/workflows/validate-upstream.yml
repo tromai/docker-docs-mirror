@@ -1,13 +1,16 @@
 # reusable workflow to validate docs from upstream repository for which pages are remotely fetched
-# - repo: repository to handle from fetch-remote in _config.yml (e.g., https://github.com/docker/buildx)
+# - module-name: the name of the module, without github.com prefix (e.g., docker/buildx)
 # - data-files-id: id of the artifact (using actions/upload-artifact) containing the YAML data files to validate (optional)
 # - data-files-folder: folder in _data containing the files to download and copy to (e.g., buildx)
+# if changes are made in this workflow, please keep commit sha updated on downstream workflows:
+# - https://github.com/docker/buildx/blob/master/.github/workflows/docs-upstream.yml
+# - https://github.com/docker/compose/blob/main/.github/workflows/docs-upstream.yml
 name: validate-upstream
 
 on:
   workflow_call:
     inputs:
-      repo:
+      module-name:
         required: true
         type: string
       data-files-id:
@@ -16,72 +19,88 @@ on:
       data-files-folder:
         required: false
         type: string
+      create-placeholder-stubs:
+        type: boolean
+        required: false
+
+env:
+  # Use edge release of buildx (latest RC, fallback to latest stable)
+  SETUP_BUILDX_VERSION: edge
+  SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       -
         name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: docker/docs
       -
-        name: Install js-yaml
-        run: npm install js-yaml
-      -
-        name: Set correct ref to fetch remote resources
-        uses: actions/github-script@v6
-        with:
-          script: |
-            const fs = require('fs');
-            const yaml = require('js-yaml');
-
-            const configFile = '_config.yml'
-            const config = yaml.load(fs.readFileSync(configFile, 'utf8'));
-            for (const remote of config['fetch-remote']) {
-              if (remote['repo'] != '${{ inputs.repo }}') {
-                continue;
-              }
-              if ("${{ github.event_name }}" == "pull_request") {
-                remote['repo'] = "${{ github.event.pull_request.head.repo.html_url }}";
-                remote['ref'] = "${{ github.event.pull_request.head.ref }}"
-              } else {
-                remote['ref'] = "${{ github.ref_name }}";
-              }
-            }
-
-            try {
-              fs.writeFileSync(configFile, yaml.dump(config), 'utf8')
-            } catch (err) {
-              console.error(err.message)
-              process.exit(1)
-            }
-      -
-        name: Prepare
-        run: |
-          # print docs jekyll config updated in previous step
-          yq _config.yml
-          # cleanup js-yaml module and data files
-          rm -rf ./node_modules
-          if [ -n "./_data/${{ inputs.data-files-folder }}" ]; then
-            rm -rf ./_data/${{ inputs.data-files-folder }}/*
-          fi
-      -
         name: Download data files
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         if: ${{ inputs.data-files-id != '' && inputs.data-files-folder != '' }}
         with:
           name: ${{ inputs.data-files-id }}
-          path: ./_data/${{ inputs.data-files-folder }}
+          path: /tmp/data/${{ inputs.data-files-folder }}
+      -
+        # Copy data files from /tmp/data/${{ inputs.data-files-folder }} to
+        # data/${{ inputs.data-files-folder }}. If create-placeholder-stubs
+        # is set to true, then check if a placeholder file exists for each data file in
+        # that folder. If not, create a placeholder stub file for the data file.
+        name: Copy data files
+        if: ${{ inputs.data-files-id != '' && inputs.data-files-folder != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const globber = await glob.create(`/tmp/data/${{ inputs.data-files-folder }}/*.yaml`);
+            for await (const yamlSrcPath of globber.globGenerator()) {
+              const yamlSrcFilename = path.basename(yamlSrcPath);
+              const yamlSrcNoExt = yamlSrcPath.replace(".yaml", "");
+              const hasSubCommands = (await (await glob.create(yamlSrcNoExt)).glob()).length > 1;
+              const yamlDestPath = path.join('data', `${{ inputs.data-files-folder }}`, yamlSrcFilename);
+              let placeholderPath = path.join("content/reference/cli", yamlSrcFilename.replace('_', '/').replace(/\.yaml$/, '.md'));
+              if (hasSubCommands) {
+                placeholderPath = placeholderPath.replace('.md', '/_index.md');
+              };
+              if (`${{ inputs.create-placeholder-stubs }}` && !fs.existsSync(placeholderPath)) {
+                fs.mkdirSync(path.dirname(placeholderPath), { recursive: true });
+                const placeholderContent = `---
+            datafolder: ${{ inputs.data-files-folder }}
+            datafile: ${yamlSrcFilename.replace(/\.[^/.]+$/, '')}
+            title: ${yamlSrcFilename.replace(/\.[^/.]+$/, "").replaceAll('_', ' ')}
+            layout: cli
+            ---`;
+                await core.group(`creating ${placeholderPath}`, async () => {
+                  core.info(placeholderContent);
+                });
+                await fs.writeFileSync(placeholderPath, placeholderContent);
+              }
+              core.info(`${yamlSrcPath} => ${yamlDestPath}`);
+              await fs.copyFileSync(yamlSrcPath, yamlDestPath);
+            }
       -
         name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
       -
         name: Validate
-        uses: docker/bake-action@v2
+        uses: docker/bake-action@v6
         with:
-          targets: validate
+          source: .
+          files: |
+            docker-bake.hcl
+          targets: validate-upstream
+          provenance: false
           set: |
             *.cache-from=type=gha,scope=docs-upstream
-            *.cache-to=type=gha,scope=docs-upstream,mode=max
+            *.cache-to=type=gha,scope=docs-upstream
+        env:
+          UPSTREAM_MODULE_NAME: ${{ inputs.module-name }}
+          UPSTREAM_REPO: ${{ github.repository }}
+          UPSTREAM_COMMIT: ${{ github.sha }}

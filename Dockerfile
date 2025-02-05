@@ -1,134 +1,151 @@
 # syntax=docker/dockerfile:1
+# check=skip=InvalidBaseImagePlatform
 
-# This Dockerfile builds the docs for https://docs.docker.com/
-# from the main branch of https://github.com/docker/docs
+ARG ALPINE_VERSION=3.21
+ARG GO_VERSION=1.23
+ARG HTMLTEST_VERSION=0.17.0
+ARG HUGO_VERSION=0.141.0
+ARG NODE_VERSION=22
+ARG PAGEFIND_VERSION=1.3.0
 
-# Use same ruby version as the one in .ruby-version
-# that is used by Netlify
-ARG RUBY_VERSION=2.7.6
-# Same as the one in Gemfile.lock
-ARG BUNDLER_VERSION=2.3.13
+# base defines the generic base stage
+FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS base
+RUN apk add --no-cache \
+    git \
+    nodejs \
+    npm \
+    gcompat
 
-ARG JEKYLL_ENV=development
-ARG DOCS_URL=http://localhost:4000
-ARG DOCS_ENFORCE_GIT_LOG_HISTORY=0
+# npm downloads Node.js dependencies
+FROM base AS npm
+ENV NODE_ENV="production"
+WORKDIR /out
+RUN --mount=source=package.json,target=package.json \
+    --mount=source=package-lock.json,target=package-lock.json \
+    --mount=type=cache,target=/root/.npm \
+    npm ci
 
-# Base stage for building
-FROM ruby:${RUBY_VERSION}-alpine AS base
-WORKDIR /src
-RUN apk add --no-cache bash build-base git
+# hugo downloads the Hugo binary
+FROM base AS hugo
+ARG TARGETARCH
+ARG HUGO_VERSION
+WORKDIR /out
+ADD https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_extended_${HUGO_VERSION}_linux-${TARGETARCH}.tar.gz .
+RUN tar xvf hugo_extended_${HUGO_VERSION}_linux-${TARGETARCH}.tar.gz
 
-# Gem stage will install bundler used as dependency manager
-# for our dependencies in Gemfile for Jekyll
-FROM base AS gem
-ARG BUNDLER_VERSION
-COPY Gemfile* .
-RUN gem uninstall -aIx bundler \
-  && gem install bundler -v ${BUNDLER_VERSION} \
-  && bundle config set force_ruby_platform true \
-  && bundle install --jobs 4 --retry 3
+# build-base is the base stage used for building the site
+FROM base AS build-base
+WORKDIR /project
+COPY --from=hugo /out/hugo /bin/hugo
+COPY --from=npm /out/node_modules node_modules
+COPY . .
 
-# Vendor Gemfile for Jekyll
-FROM gem AS vendored
-ARG BUNDLER_VERSION
-RUN bundle update \
-  && mkdir /out \
-  && cp Gemfile.lock /out
+# build creates production builds with Hugo
+FROM build-base AS build
+# HUGO_ENV sets the hugo.Environment (production, development, preview)
+ARG HUGO_ENV="development"
+# DOCS_URL sets the base URL for the site
+ARG DOCS_URL="https://docs.docker.com"
+ENV HUGO_CACHEDIR="/tmp/hugo_cache"
+RUN --mount=type=cache,target=/tmp/hugo_cache \
+    hugo --gc --minify -e $HUGO_ENV -b $DOCS_URL
 
-# Stage used to output the vendored Gemfile.lock:
-# > make vendor
-# or
-# > docker buildx bake vendor
+# lint lints markdown files
+FROM davidanson/markdownlint-cli2:v0.14.0 AS lint
+USER root
+RUN --mount=type=bind,target=. \
+    /usr/local/bin/markdownlint-cli2 \
+    "content/**/*.md" \
+    "#content/manuals/engine/release-notes/*.md" \
+    "#content/manuals/desktop/previous-versions/*.md"
+
+# test validates HTML output and checks for broken links
+FROM wjdp/htmltest:v${HTMLTEST_VERSION} AS test
+WORKDIR /test
+COPY --from=build /project/public ./public
+ADD .htmltest.yml .htmltest.yml
+RUN htmltest
+
+# update-modules downloads and vendors Hugo modules
+FROM build-base AS update-modules
+# MODULE is the Go module path and version of the module to update
+ARG MODULE
+RUN <<"EOT"
+set -ex
+if [ -n "$MODULE" ]; then
+    hugo mod get ${MODULE}
+    RESOLVED=$(cat go.mod | grep -m 1 "${MODULE/@*/}" | awk '{print $1 "@" $2}')
+    go mod edit -replace "${MODULE/@*/}=${RESOLVED}";
+else
+    echo "no module set";
+fi
+EOT
+RUN hugo mod vendor
+
+# vendor is an empty stage with only vendored Hugo modules
 FROM scratch AS vendor
-COPY --from=vendored /out /
+COPY --from=update-modules /project/_vendor /_vendor
+COPY --from=update-modules /project/go.* /
 
-# Build the static HTML for the current docs.
-# After building with jekyll, fix up some links
-FROM gem AS generate
-ARG JEKYLL_ENV
-ARG DOCS_URL
-ARG DOCS_ENFORCE_GIT_LOG_HISTORY
-ENV TARGET=/out
-RUN --mount=type=bind,target=.,rw \
-    --mount=type=cache,target=/tmp/docker-docs-clone \
-    --mount=type=cache,target=/src/.jekyll-cache <<EOT
-  set -eu
-  CONFIG_FILES="_config.yml"
-  if [ "${JEKYLL_ENV}" = "production" ]; then
-    CONFIG_FILES="${CONFIG_FILES},_config_production.yml"
-  elif [ "${DOCS_URL}" = "https://docs-stage.docker.com" ]; then
-    CONFIG_FILES="${CONFIG_FILES},_config_stage.yml"
-  fi
-  set -x
-  bundle exec jekyll build --profile -d ${TARGET} --config ${CONFIG_FILES}
+# build-upstream builds an upstream project with a replacement module
+FROM build-base AS build-upstream
+# UPSTREAM_MODULE_NAME is the canonical upstream repository name and namespace (e.g. moby/buildkit)
+ARG UPSTREAM_MODULE_NAME
+# UPSTREAM_REPO is the repository of the project to validate (e.g. dvdksn/buildkit)
+ARG UPSTREAM_REPO
+# UPSTREAM_COMMIT is the commit hash of the upstream project to validate
+ARG UPSTREAM_COMMIT
+# HUGO_MODULE_REPLACEMENTS is the replacement module for the upstream project
+ENV HUGO_MODULE_REPLACEMENTS="github.com/${UPSTREAM_MODULE_NAME} -> github.com/${UPSTREAM_REPO} ${UPSTREAM_COMMIT}"
+RUN hugo --ignoreVendorPaths "github.com/${UPSTREAM_MODULE_NAME}"
+
+# validate-upstream validates HTML output for upstream builds
+FROM wjdp/htmltest:v${HTMLTEST_VERSION} AS validate-upstream
+WORKDIR /test
+COPY --from=build-upstream /project/public ./public
+ADD .htmltest.yml .htmltest.yml
+RUN htmltest
+
+# unused-media checks for unused graphics and other media
+FROM alpine:${ALPINE_VERSION} AS unused-media
+RUN apk add --no-cache fd ripgrep
+WORKDIR /test
+RUN --mount=type=bind,target=. ./hack/test/unused_media
+
+# path-warnings checks for duplicate target paths
+FROM build-base AS path-warnings
+RUN hugo --printPathWarnings > ./path-warnings.txt
+RUN <<EOT
+DUPLICATE_TARGETS=$(grep "Duplicate target paths" ./path-warnings.txt)
+if [ ! -z "$DUPLICATE_TARGETS" ]; then
+    echo "$DUPLICATE_TARGETS"
+    echo "You probably have a duplicate alias defined. Please check your aliases."
+    exit 1
+fi
 EOT
 
-# htmlproofer checks for broken links
-FROM gem AS htmlproofer-base
-RUN --mount=type=bind,from=generate,source=/out,target=_site <<EOF
-  htmlproofer ./_site \
-    --disable-external \
-    --internal-domains="docs.docker.com,docs-stage.docker.com,localhost:4000" \
-    --file-ignore="/^./_site/engine/api/.*$/,./_site/registry/configuration/index.html" \
-    --url-ignore="/^/docker-hub/api/latest/.*$/,/^/engine/api/v.+/#.*$/,/^/glossary/.*$/" > /results 2>&1
-  rc=$?
-  if [[ $rc -eq 0 ]]; then
-    echo -n > /results
-  fi
-EOF
+# pagefind installs the Pagefind runtime
+FROM base AS pagefind
+ARG PAGEFIND_VERSION
+COPY --from=build /project/public ./public
+RUN --mount=type=bind,src=pagefind.yml,target=pagefind.yml \
+    npx pagefind@v${PAGEFIND_VERSION} --output-path "/pagefind"
 
-FROM htmlproofer-base as htmlproofer
-RUN <<EOF
-  cat /results
-  [ ! -s /results ] || exit 1
-EOF
+# index generates a Pagefind index
+FROM scratch AS index
+COPY --from=pagefind /pagefind .
 
-FROM scratch as htmlproofer-output
-COPY --from=htmlproofer-base /results /results
+# test-go-redirects checks that the /go/ redirects are valid
+FROM alpine:${ALPINE_VERSION} AS test-go-redirects
+WORKDIR /work
+RUN apk add yq
+COPY --from=build /project/public ./public
+RUN --mount=type=bind,target=. <<"EOT"
+set -ex
+./hack/test/go_redirects
+EOT
 
-# mdl is a lint tool for markdown files
-FROM gem AS mdl-base
-ARG MDL_JSON
-ARG MDL_STYLE
-RUN --mount=type=bind,target=. <<EOF
-  mdl --ignore-front-matter ${MDL_JSON:+'--json'} --style=${MDL_STYLE:-'.markdownlint.rb'} $( \
-    find '.' -name '*.md' \
-      -not -path './registry/*' \
-      -not -path './desktop/extensions-sdk/*' \
-  ) > /results
-  rc=$?
-  if [[ $rc -eq 0 ]]; then
-    echo -n > /results
-  fi
-EOF
-
-FROM mdl-base as mdl
-RUN <<EOF
-  cat /results
-  [ ! -s /results ] || exit 1
-EOF
-
-FROM scratch as mdl-output
-COPY --from=mdl-base /results /results
-
-# Release the generated files in a scratch image
-# Can be output to your host with:
-# > make release
-# or
-# > docker buildx bake release
+# release is an empty scratch image with only compiled assets
 FROM scratch AS release
-COPY --from=generate /out /
-
-# Create a runnable nginx instance with generated HTML files.
-# When the image is run, it starts Nginx and serves the docs at port 4000:
-# > make deploy
-# or
-# > docker-compose up --build
-FROM nginx:alpine AS deploy
-COPY --from=release / /usr/share/nginx/html
-COPY _deploy/nginx/default.conf /etc/nginx/conf.d/default.conf
-ARG JEKYLL_ENV
-ENV JEKYLL_ENV=${JEKYLL_ENV}
-CMD echo -e "Docker docs are viewable at:\nhttp://0.0.0.0:4000 (build target: ${JEKYLL_ENV})"; exec nginx -g 'daemon off;'
-
-FROM deploy
+COPY --from=build /project/public /
+COPY --from=pagefind /pagefind /pagefind
